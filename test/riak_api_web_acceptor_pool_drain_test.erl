@@ -38,10 +38,15 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TEST_OBJECT_KEY, <<"foo">>).
+%% Must stay below the EUnit default per-test timeout so a drained pool fails
+%% with acceptor_pool_drained instead of timing out inside poll_active_pool_until_positive.
+-define(POOL_REFILL_POLL_MAX_MS, 2500).
 
 acceptor_pool_drain_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun(State) ->
-        [fun() -> max_out_acceptor_pool(State) end]
+        %% Default EUnit per-test timeout is short; polling and the failure-path
+        %% probe can exceed it when the pool stays empty.
+        {timeout, 30, [fun() -> max_out_acceptor_pool(State) end]}
     end}.
 
 setup() ->
@@ -82,9 +87,9 @@ max_out_acceptor_pool({SpecName, IPAddr, Port}) ->
     ),
     %% Read responses until close so work finishes and connections drop.
     lists:foreach(fun flush_http_client/1, Sockets),
-    %% Let EXIT casts and pool bookkeeping run before we inspect pool size.
-    ok = timer:sleep(400),
-    Pool = riak_api_web_socket:get_active_pool_size(SpecName),
+    %% Acceptor processes exit asynchronously; the socket gen_server must process
+    %% {'EXIT', ...} and spawn replacements. A fixed sleep is flaky on slow CI.
+    Pool = poll_active_pool_size(SpecName, ?POOL_REFILL_POLL_MAX_MS, 25),
     ServerAtom = binary_to_existing_atom(SpecName),
     if
         Pool > 0 ->
@@ -109,6 +114,33 @@ max_out_acceptor_pool({SpecName, IPAddr, Port}) ->
     end,
     %% Listener must stay registered after the scenario.
     ?assert(is_pid(whereis(ServerAtom))).
+
+%% Poll until the acceptor set is non-empty or the deadline passes. Each
+%% iteration uses gen_server:call on the listener, which advances its mailbox
+%% so EXIT handling can catch up with client teardown.
+-spec poll_active_pool_size(
+    binary(),
+    pos_integer(),
+    pos_integer()
+) -> non_neg_integer().
+poll_active_pool_size(SpecName, MaxWaitMs, SleepMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + MaxWaitMs,
+    poll_active_pool_size_loop(SpecName, Deadline, SleepMs).
+
+poll_active_pool_size_loop(SpecName, Deadline, SleepMs) ->
+    Sz = riak_api_web_socket:get_active_pool_size(SpecName),
+    case Sz > 0 of
+        true ->
+            Sz;
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    Sz;
+                false ->
+                    ok = timer:sleep(SleepMs),
+                    poll_active_pool_size_loop(SpecName, Deadline, SleepMs)
+            end
+    end.
 
 connect_clients(IPAddr, Port, N) ->
     [
