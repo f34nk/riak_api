@@ -27,7 +27,8 @@
 %% Each acceptor is an `riak_api_web_acceptor` - an as each acceptor accepts
 %% a connection, it will prompt this socket server to launch a new acceptor.
 %% When a linked acceptor closes (along with the connection), the close message
-%% is handled and the closed acceptor is removed from the pool.
+%% is handled: the acceptor is removed from the pool and a replacement acceptor
+%% is started so the listener can accept again.
 %%
 %% The intention is that there should always be at least the pool size of
 %% acceptors waiting for a connection - unless the max size is reached, and no
@@ -305,14 +306,34 @@ handle_cast(accepted, State) ->
     end.
 
 handle_info({'EXIT', Pid, normal}, State) ->
-    {
-        noreply,
-        State#socket_state{
-            pool_size = State#socket_state.pool_size - 1,
-            acceptor_pool =
-                sets:del_element(Pid, State#socket_state.acceptor_pool)
-        }
-    };
+    % {
+    %     noreply,
+    %     State#socket_state{
+    %         pool_size = State#socket_state.pool_size - 1,
+    %         acceptor_pool =
+    %             sets:del_element(Pid, State#socket_state.acceptor_pool)
+    %     }
+    % };
+    Pool = State#socket_state.acceptor_pool,
+    case sets:is_element(Pid, Pool) of
+        true ->
+            NewPool = sets:del_element(Pid, Pool),
+            NewPS = State#socket_state.pool_size - 1,
+            Replacement =
+                riak_api_web_acceptor:start_link(
+                    State#socket_state.listener,
+                    State#socket_state.port
+                ),
+            {
+                noreply,
+                State#socket_state{
+                    pool_size = NewPS + 1,
+                    acceptor_pool = sets:add_element(Replacement, NewPool)
+                }
+            };
+        false ->
+            {noreply, State}
+    end;
 handle_info({'EXIT', Pid, Reason}, State) ->
     ?LOG_ERROR("Acceptor ~p unexpectedly crashed: ~0p", [Pid, Reason]),
     handle_info({'EXIT', Pid, normal}, State).
